@@ -22,16 +22,16 @@ BOARD_SQUARES       = (5, 5)                   # physical squares on printed boa
 BOARD_INNER         = (BOARD_SQUARES[0]-1, BOARD_SQUARES[1]-1)
 SQUARE_MM           = 10.0                     # edge length of one square, in mm
 
-DETECTIONS_REQ      = 10                       # frames needed for calibration
-FRAME_STRIDE        = 5                        # sample every Nth frame for calibration
-MAX_CALIB_FRAMES    = 2000                     # upper cap for scanning
-SCALE_DEF           = 0.43348014               # fallback mm/px if calibration fails
-UNDISTORT           = True                     # undistort frames during measurement
+DETECTIONS_REQ      = 3                       # frames needed for calibration
+FRAME_STRIDE        = 2                        # sample every Nth frame for calibration
+MAX_CALIB_FRAMES    = 100                     # upper cap for scanning
+SCALE_DEF           = 3.7            # fallback mm/px if calibration fails
+UNDISTORT           = False                     # undistort frames during measurement
 DURATION_S          = 3.5                      # trimmed window after baseline (~rest) frame
 TRIM_THRESHOLD_PX   = 5                        # |lin_px| <= threshold → baseline frame
 
-# Target colour (mask) — magenta example (HSV)
-COLOUR_RANGE_LO     = np.array([150, 70, 70],  dtype=np.uint8)
+# Target colour (mask) — magenta (HSV)
+COLOUR_RANGE_LO     = np.array([150, 180, 180],  dtype=np.uint8)
 COLOUR_RANGE_HI     = np.array([180, 255, 255], dtype=np.uint8)
 KERNEL              = np.ones((5,5), np.uint8)
 
@@ -222,6 +222,63 @@ def process(video_path, out_dir):
             x, y, w, h = cv2.boundingRect(c)
             area = float(cv2.contourArea(c))
 
+            # --- bending angle (base -> tip) ---
+            pts = c.reshape(-1, 2)  # Nx2
+
+            # 1) TIP = topmost point (min y)
+            tip_idx = np.argmin(pts[:, 1])
+            tip = pts[tip_idx].astype(float)
+
+            # 2) BASE center = centroid of bottom band of the contour
+            ymin, ymax = pts[:,1].min(), pts[:,1].max()
+            height = ymax - ymin
+            band_h = max(6.0, 0.12 * height)  # bottom 12% (min 6 px to reduce noise)
+            base_band = pts[pts[:,1] >= (ymax - band_h)]
+            if len(base_band) >= 5:
+                base_cx = float(np.mean(base_band[:,0]))
+                base_cy = float(np.mean(base_band[:,1]))
+            else:
+                # fallback to bounding-box bottom center
+                base_cx = float(x + w/2.0)
+                base_cy = float(y + h)
+
+            # 3) Angle of vector base->tip relative to vertical (+ right = positive)
+            dx = tip[0] - base_cx
+            dy = base_cy - tip[1]           # positive when tip is above base (screen y grows downward)
+            bend_rad = math.atan2(dx, dy)   # atan2(x, y): 0 means vertical; sign gives left/right
+            bend_deg = math.degrees(bend_rad)
+
+            # Optional: convert to mm if you want the *offset* (you already have scale)
+            radial_offset_mm = dx * scale   # horizontal offset at the tip
+            axial_offset_mm  = dy * scale   # vertical separation base->tip
+
+            # Smooth angle a bit to reduce jitter (simple EMA)
+            if frame_idx == 0:
+                bend_deg_smooth = bend_deg
+            else:
+                alpha = 0.2
+                bend_deg_smooth = alpha * bend_deg + (1 - alpha) * per_frame[-1].get("bend_deg_smooth", bend_deg)
+
+            # # Store
+            # record = {
+            #     "frame": frame_idx,
+            #     # ... your existing fields ...
+            #     "bend_deg": bend_deg,
+            #     "bend_deg_smooth": bend_deg_smooth,
+            #     "tip_x": float(tip[0]),
+            #     "tip_y": float(tip[1]),
+            #     "base_cx": base_cx,
+            #     "base_cy": base_cy,
+            # }
+            # per_frame.append({**per_frame[-1], **record}) if cnts else None
+
+            # Viz overlay (optional)
+            cv2.circle(frame, (int(base_cx), int(base_cy)), 5, (0, 255, 255), -1)
+            cv2.circle(frame, (int(tip[0]), int(tip[1])), 5, (255, 255, 0), -1)
+            cv2.line(frame, (int(base_cx), int(base_cy)), (int(tip[0]), int(tip[1])), (255, 255, 255), 2)
+            cv2.putText(frame, f"bend: {bend_deg_smooth:+.1f} deg", (x, max(0, y-10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+
             # initialize extrema on first detection
             if not found_any:
                 min_w = max_w = float(w)
@@ -262,6 +319,12 @@ def process(video_path, out_dir):
                 "lin_vel_mm": lin_vel_mm,
                 "rad_vel_mm": rad_vel_mm,
                 "area_vel_mm": area_vel_mm,
+                "bend_deg": bend_deg,
+                "bend_deg_smooth": bend_deg_smooth,
+                "tip_x": float(tip[0]),
+                "tip_y": float(tip[1]),
+                "base_cx": base_cx,
+                "base_cy": base_cy
             })
 
             # overlay viz
@@ -324,6 +387,7 @@ def process(video_path, out_dir):
         "lin_mm","rad_mm","area_mm",
         "lin_vel_mm","rad_vel_mm","area_vel_mm",
         "lin_norm","rad_norm","area_norm",
+        "bend_deg","bend_deg_smooth","tip_x","tip_y","base_cx","base_cy"
     ]
 
     max_lin_frame = None

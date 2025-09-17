@@ -13,7 +13,7 @@ For each file:
 import json, os, glob, pandas as pd
 
 # ─────────── USER SETTINGS ────────────────────────────────────────────
-INPUT_DIR       = "force_data/"          # folder of *.json logs
+INPUT_DIR       = "raw_force_data/"          # folder of *.json logs
 OUTPUT_DIR      = "./force_data_extracted/"         # where CSVs will go
 
 FORCE_LOW_N    = 0.1

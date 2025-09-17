@@ -1,0 +1,2 @@
+video,inflation_period_s,max_lin_mm,max_lin_time,max_rad_mm,max_rad_time,max_area_mm,max_area_time,max_bend_deg,max_bend_time,mm_per_px
+test1,3.5,123.02712513253991,3.2,33.25057436014592,2.966666666666667,7912.4838895074545,3.1333333333333333,12.425942865427487,3.033333333333333,0.36945082622384356
