@@ -1,0 +1,6 @@
+# ignore folder: data-processing/keep_data
+data-processing/processed_video_data/
+
+# ignore file types
+*.mp4
+*.csv

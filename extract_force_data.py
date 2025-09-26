@@ -3,7 +3,7 @@
 Batch-extract “force-ramp” regions from all JSON logs in a folder.
 
 For each file:
-  • Ignore everything up to (and incl.) the first gpio.C1 == True row
+  • Ignore everything up to (and incl.) the first gpio.C2 == True row
   • Start 10 rows BEFORE the first sample whose |force| > 0.1 kN [set suitable threshold]
   • End at the first sample whose |force| ≥ 5 kN
   • Export time_s, position, velocity, load_cell.force (all abs), gpio.C1-3
@@ -40,12 +40,12 @@ def process_file(path: str):
     df["time_s"] = (df["ts"] - df["ts"].iloc[0]) / 1e9
     df.drop(columns="ts", inplace=True)
 
-    # after first gpio.C1 == True
-    c1_idx = df.index[df["gpio.C1"] == True]
-    if c1_idx.empty:
-        print(f"⚠ {os.path.basename(path)}: no gpio.C1==True, skipped")
+    # after first gpio.C2 == True
+    c2_idx = df.index[df["gpio.C2"] == True]
+    if c2_idx.empty:
+        print(f"⚠ {os.path.basename(path)}: no gpio.C2==True, skipped")
         return None
-    df2 = df.iloc[df.index.get_loc(c1_idx[0]) + 1 :]
+    df2 = df.iloc[df.index.get_loc(c2_idx[0]) + 1 :]
 
     # start (|force| > low threshold)
     abs_force = df2["load_cell.force"].abs()

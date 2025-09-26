@@ -1,13 +1,18 @@
 # process_video_data.py
 # -----------------------------------
 # Per-video calibration + measurement pipeline with linear-extension and bending-angle tracking.
-
-# Updates vs v2:
-#   1) Base center locks to bbox bottom mid-point (x + w/2, y + h) on first valid frame.
-#   2) Tip is found via HSV inRange INSIDE the filled contour (tunable DOT_RANGE_LO/HI).
-#      If not found, fallback = topmost contour point, with a console note per frame.
-#   3) Also logs horizontal displacement (tip_x - base_x) in px and mm
-#      (assumes the end-effector starts centered at rest).
+#
+# Bending tip selection rule:
+#   * Base point (locked once): bbox bottom mid-point (x + w/2, y + h)
+#   * Tip point:
+#       - Use HIGHEST contour point by default
+#       - If the highest point's x is OUTSIDE the original bbox width range
+#         (captured on the first valid frame), use the bbox top corner (left or right)
+#         with the larger |x - base_x|.
+#
+# Summary CSV tweak:
+#   * "max_bend_deg", "max_bend_mm", "max_bend_time" now correspond to the frame where
+#     the BOUNDING-BOX AREA (w*h) is maximal (not the absolute max bend across the run).
 #
 # Usage:
 #   Set INPUT_DIR and OUTPUT_DIR below, then run:
@@ -22,10 +27,13 @@ import math
 import numpy as np
 
 # ---------------- I/O ----------------
-INPUT_DIR  = "raw_video_data"               # <- SET
-OUTPUT_DIR = "./processed_video_data"       # <- SET
+INPUT_DIR  = "raw_video_data/ExRunBending1 - MP4"   # <- SET
+OUTPUT_DIR = "./processed_video_data/ExRunBending"  # <- SET
 
-SPEC_VIDEO = "test1.mp4"                # for single-file debug runs; set to None to batch process all videos in INPUT_DIR
+SPEC_VIDEO = None  # for single-file debug runs; set to None to batch process all videos in INPUT_DIR
+
+# ---- Toggle bending calculations/outputs here ----
+BENDING_ENABLED = True   # set False to skip bending angle & horizontal displacement entirely
 
 # ---------------- CONFIG ----------------
 # Chessboard for mm/px scale
@@ -35,29 +43,16 @@ SQUARE_MM           = 10.0                     # edge length of one square, in m
 
 DETECTIONS_REQ      = 3
 FRAME_STRIDE        = 2
-MAX_CALIB_FRAMES    = 10
-SCALE_DEF           = 0.37
+MAX_CALIB_FRAMES    = 20
+SCALE_DEF           = 0.38  # fallback mm/px if calibration fails
 UNDISTORT           = False
-DURATION_S          = 3.5
+DURATION_S          = 3.0
 TRIM_THRESHOLD_PX   = 5
 
-# Body color (magenta) mask in HSV
-COLOUR_RANGE_LO     = np.array([150, 180, 180],  dtype=np.uint8)
+# Body color (magenta) mask in HSV (tune as needed)
+COLOUR_RANGE_LO     = np.array([140,  50, 175], dtype=np.uint8)
 COLOUR_RANGE_HI     = np.array([180, 255, 255], dtype=np.uint8)
 KERNEL              = np.ones((5,5), np.uint8)
-
-# Tip dot detection in HSV (tune these to test different colours/sizes)
-# Example for a BLACK dot: H any, S any, V <= ~60 → (0,0,0) .. (180,255,60)
-DOT_RANGE_LO        = np.array([  0,   0,   0], dtype=np.uint8)
-DOT_RANGE_HI        = np.array([180, 255,  60], dtype=np.uint8)
-
-DOT_TOP_FRAC        = 0.45          # restrict search to top fraction of the contour height
-DOT_MIN_AREA_PX     = 4             # absolute min blob area to accept
-DOT_MAX_AREA_FRAC   = 0.10          # max blob area as fraction of body contour area
-DOT_OPEN_K          = 3             # small morphology open to denoise
-
-# # Angle smoothing (EMA)
-# ANGLE_EMA_ALPHA     = 0.2
 
 # Video codecs to try (in order)
 CODECS = [("avc1",".mp4"), ("mp4v",".mp4"), ("MJPG",".avi")]
@@ -143,58 +138,6 @@ def open_writer(sample_frame, base_out):
         print(f"[WARN] Codec {fourcc} failed, trying next...")
     raise RuntimeError("Could not open any VideoWriter")
 
-# ---- Tip detection INSIDE the contour using HSV ----
-def find_tip_in_contour_hsv(frame_bgr, contour, hsv_lo, hsv_hi,
-                            top_frac, min_area_px, max_area_frac, open_k=3):
-    """
-    Returns (tip_x, tip_y) in full-frame coords or None.
-    Works on the FULL FRAME masked to the FILLED contour (no bbox dependence).
-    """
-    H, W = frame_bgr.shape[:2]
-    mask_full = np.zeros((H, W), dtype=np.uint8)
-    cv2.drawContours(mask_full, [contour], -1, 255, cv2.FILLED)
-
-    pts = contour.reshape(-1, 2)
-    ymin, ymax = float(pts[:,1].min()), float(pts[:,1].max())
-    height = ymax - ymin
-    y_cut = int(ymin + top_frac * height)
-
-    top_mask = np.zeros_like(mask_full)
-    top_mask[:max(y_cut, 0), :] = 255
-    mask_top_contour = cv2.bitwise_and(mask_full, top_mask)
-
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    dot_mask = cv2.inRange(hsv, hsv_lo, hsv_hi)
-    dot_mask = cv2.bitwise_and(dot_mask, mask_top_contour)
-
-    if open_k and open_k > 1:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k, open_k))
-        dot_mask = cv2.morphologyEx(dot_mask, cv2.MORPH_OPEN, k)
-
-    cnts, _ = cv2.findContours(dot_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return None
-
-    body_area = cv2.contourArea(contour)
-    max_area_px = max_area_frac * body_area
-
-    candidates = []
-    for cc in cnts:
-        a = cv2.contourArea(cc)
-        if a < min_area_px or a > max_area_px:
-            continue
-        M = cv2.moments(cc)
-        if M["m00"] <= 1e-6: continue
-        cx = M["m10"]/M["m00"]; cy = M["m01"]/M["m00"]
-        candidates.append((cx, cy, a))
-
-    if not candidates:
-        return None
-
-    # Highest candidate (smallest y)
-    cx, cy, _ = min(candidates, key=lambda t: t[1])
-    return float(cx), float(cy)
-
 # ---------------- Per-video processing ----------------
 def process(video_path, out_dir):
     os.makedirs(out_dir, exist_ok=True)
@@ -233,9 +176,11 @@ def process(video_path, out_dir):
     prev_rad_mm = 0.0
     prev_area_mm = 0.0
 
-    # base lock (bbox bottom mid-point)
+    # base & original bbox width range (from first valid detection)
     base_cx_locked = None
     base_cy_locked = None
+    baseline_bbox_left = None
+    baseline_bbox_right = None
 
     per_frame = []
     frame_idx = 0
@@ -265,72 +210,84 @@ def process(video_path, out_dir):
             area = float(cv2.contourArea(c))
             pts = c.reshape(-1, 2)
 
-            # ---- Lock base center ONCE: bbox bottom mid-point ----
-            if base_cx_locked is None:
-                base_cx_locked = float(x + w/2.0)
-                base_cy_locked = float(y + h)   # bottom edge
-            base_cx = base_cx_locked
-            base_cy = base_cy_locked
-
-            # ---- Tip via HSV inside contour; fallback = topmost point ----
-            tip_xy = find_tip_in_contour_hsv(
-                frame, c, DOT_RANGE_LO, DOT_RANGE_HI,
-                DOT_TOP_FRAC, DOT_MIN_AREA_PX, DOT_MAX_AREA_FRAC, open_k=DOT_OPEN_K
-            )
-            fallback_used = False
-            if tip_xy is not None:
-                tip = np.array(tip_xy, dtype=float)
-            else:
-                tip_idx = np.argmin(pts[:, 1])
-                tip = pts[tip_idx].astype(float)
-                fallback_used = True
-                # print(f"[INFO] Frame {frame_idx}: tip HSV fallback → using topmost contour point.")
-
-            # ---- Bending angle (base -> tip) ----
-            dx_px = tip[0] - base_cx
-            dy = base_cy - tip[1]             # screen y downward → invert
-            bend_rad = math.atan2(dx_px, dy)   # 0 = vertical; sign: + right, - left
-            bend_deg = math.degrees(bend_rad)
-
-            # Horizontal displacement (assumes tip starts centered at rest)
-            horiz_disp_px = dx_px
-            horiz_disp_mm = horiz_disp_px * scale
-
-            # if frame_idx == 0:
-            #     bend_deg_smooth = bend_deg
-            # else:
-            #     bend_deg_prev = per_frame[-1].get("bend_deg_smooth", bend_deg)
-            #     bend_deg_smooth = ANGLE_EMA_ALPHA * bend_deg + (1 - ANGLE_EMA_ALPHA) * bend_deg_prev
-
-            # initialize extrema on first detection
+            # ---- initialize extrema & baseline bbox range on first detection
             if not found_any:
                 min_w = max_w = float(w)
                 min_h = max_h = float(h)
                 min_area = max_area = float(area)
+                baseline_bbox_left  = float(x)
+                baseline_bbox_right = float(x + w)
                 found_any = True
 
-            # update extrema
+            # ---- bending path (optional)
+            bend_fields = {}
+            if BENDING_ENABLED:
+                # Lock base center ONCE: bbox bottom mid-point
+                if base_cx_locked is None:
+                    base_cx_locked = float(x + w/2.0)
+                    base_cy_locked = float(y + h)   # bottom edge
+                base_cx = base_cx_locked
+                base_cy = base_cy_locked
+
+                # Tip DEFAULT: highest contour point
+                tip_highest = pts[np.argmin(pts[:, 1])].astype(float)
+                tip_x = float(tip_highest[0])
+
+                # Condition: if highest tip x is OUTSIDE initial bbox width range → use corner
+                use_corner = (
+                    baseline_bbox_left is not None and baseline_bbox_right is not None and
+                    (tip_x < baseline_bbox_left or tip_x > baseline_bbox_right)
+                )
+
+                if use_corner:
+                    left_top  = np.array([float(x),       float(y)], dtype=float)
+                    right_top = np.array([float(x + w),   float(y)], dtype=float)
+                    dx_left   = left_top[0]  - base_cx
+                    dx_right  = right_top[0] - base_cx
+                    tip = right_top if abs(dx_right) >= abs(dx_left) else left_top
+                else:
+                    tip = tip_highest
+
+                # Bending angle (base -> tip) + horizontal displacement
+                dx_px = tip[0] - base_cx
+                dy    = base_cy - tip[1]            # screen y downward → invert
+                bend_rad = math.atan2(dx_px, dy)    # 0 = vertical; sign: + right, - left
+                bend_deg = abs(math.degrees(bend_rad))
+                horiz_disp_px = dx_px
+                horiz_disp_mm = horiz_disp_px * scale
+
+                bend_fields.update({
+                    "bend_deg": bend_deg,
+                    "tip_x": float(tip[0]),
+                    "tip_y": float(tip[1]),
+                    "base_cx": base_cx,
+                    "base_cy": base_cy,
+                    "horiz_disp_px": float(horiz_disp_px),
+                    "horiz_disp_mm": float(horiz_disp_mm)
+                })
+
+            # ---- update extrema
             min_w, max_w = min(min_w, w), max(max_w, w)
             min_h, max_h = min(min_h, h), max(max_h, h)
             min_area, max_area = min(min_area, area), max(max_area, area)
 
-            # deltas relative to current minima
+            # ---- deltas relative to current minima
             lin_px  = float(h - min_h)
             rad_px  = float(w - min_w)
             area_px = float(area - min_area)
 
-            # convert to mm / mm^2
+            # ---- convert to mm / mm^2
             lin_mm  = lin_px  * scale
             rad_mm  = rad_px  * scale
             area_mm = area_px * (scale ** 2)
 
-            # velocities
+            # ---- velocities
             lin_vel_mm  = (lin_mm  - prev_lin_mm)  / dt if frame_idx else 0.0
             rad_vel_mm  = (rad_mm  - prev_rad_mm)  / dt if frame_idx else 0.0
             area_vel_mm = (area_mm - prev_area_mm) / dt if frame_idx else 0.0
 
-            # store record
-            per_frame.append({
+            # ---- store record
+            rec = {
                 "frame": frame_idx,
                 "x": x, "y": y, "w": w, "h": h,
                 "area_px": area_px,
@@ -342,35 +299,35 @@ def process(video_path, out_dir):
                 "lin_vel_mm": lin_vel_mm,
                 "rad_vel_mm": rad_vel_mm,
                 "area_vel_mm": area_vel_mm,
-                "bend_deg": bend_deg,
-                # "bend_deg_smooth": bend_deg_smooth,
-                "tip_x": float(tip[0]),
-                "tip_y": float(tip[1]),
-                "base_cx": base_cx,
-                "base_cy": base_cy,
-                "horiz_disp_px": float(horiz_disp_px),
-                "horiz_disp_mm": float(horiz_disp_mm)
-            })
+            }
+            if BENDING_ENABLED:
+                rec.update(bend_fields)
+            per_frame.append(rec)
 
             # ---- overlay viz ----
             overlay = frame.copy()
             cv2.rectangle(frame, (x, y), (x+w, y+h), (0,255,0), 2)
             cv2.drawContours(overlay, [c], -1, (0,0,255), cv2.FILLED)
             cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
-            cv2.circle(frame, (int(base_cx), int(base_cy)), 5, (0, 255, 255), -1)
-            cv2.circle(frame, (int(tip[0]), int(tip[1])), 5, (255, 255, 0), -1)
-            cv2.line(frame, (int(base_cx), int(base_cy)), (int(tip[0]), int(tip[1])), (255, 255, 255), 2)
 
             label_y = max(0, int(min(pts[:,1])) - 60)
             cv2.putText(frame, f"Lin ext: {lin_mm:+.1f} mm",
                         (int(min(pts[:,0])), label_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
-            cv2.putText(frame, f"Bend ang: {bend_deg:+.1f} deg",
-                        (int(min(pts[:,0])), label_y + 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
-            cv2.putText(frame, f"Bend dx: {horiz_disp_mm:+.1f} mm",
-                        (int(min(pts[:,0])), label_y + 44),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+
+            if BENDING_ENABLED and bend_fields:
+                cv2.circle(frame, (int(bend_fields["base_cx"]), int(bend_fields["base_cy"])), 5, (0, 255, 255), -1)
+                cv2.circle(frame, (int(bend_fields["tip_x"]), int(bend_fields["tip_y"])), 5, (255, 255, 0), -1)
+                cv2.line(frame,
+                         (int(bend_fields["base_cx"]), int(bend_fields["base_cy"])),
+                         (int(bend_fields["tip_x"]), int(bend_fields["tip_y"])),
+                         (255, 255, 255), 2)
+                cv2.putText(frame, f"Bend ang: {bend_fields['bend_deg']:+.1f} deg",
+                            (int(min(pts[:,0])), label_y + 22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+                cv2.putText(frame, f"Bend dx: {bend_fields['horiz_disp_mm']:+.1f} mm",
+                            (int(min(pts[:,0])), label_y + 44),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
 
         # lazy-open writer once we know frame dims
         if vw is None:
@@ -397,9 +354,6 @@ def process(video_path, out_dir):
     max_rad_mm  = float((max_w - min_w) * scale) if max_w >= min_w else 0.0
     max_area_mm = float((max_area - min_area) * (scale ** 2)) if max_area >= min_area else 0.0
 
-    max_bending_angle = max((abs(rec["bend_deg"]) for rec in per_frame), default=0.0)
-    max_bending_dist  = max((abs(rec["horiz_disp_mm"]) for rec in per_frame), default=0.0)
-
     # ---- trim per_frame to "last rest frame" + DURATION_S seconds
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     dt = 1.0 / fps
@@ -414,20 +368,22 @@ def process(video_path, out_dir):
 
     # build normalized values and write the trimmed CSV
     csv_frames = os.path.join(out_dir, f"{name}__frames.csv")
-    fieldnames = [
+    base_fields = [
         "frame","time_s","x","y","w","h",
         "area_px","lin_px","rad_px",
         "lin_mm","rad_mm","area_mm",
         "lin_vel_mm","rad_vel_mm","area_vel_mm",
         "lin_norm","rad_norm","area_norm",
+    ]
+    bend_fields = [
         "bend_deg","tip_x","tip_y","base_cx","base_cy",
         "horiz_disp_px","horiz_disp_mm"
     ]
+    fieldnames = base_fields + (bend_fields if BENDING_ENABLED else [])
 
     max_lin_frame = None
     max_rad_frame = None
     max_area_frame = None
-    max_bend_frame = None
 
     with open(csv_frames, "w", newline="") as f:
         wr = csv.DictWriter(f, fieldnames=fieldnames)
@@ -453,28 +409,55 @@ def process(video_path, out_dir):
                 max_rad_frame = new_frame
             if rec_out["area_norm"] == 1.0 and max_area_frame is None:
                 max_area_frame = new_frame
-            if abs(rec["bend_deg"]) == max_bending_angle and max_bend_frame is None:
-                max_bend_frame = new_frame
+
+            if not BENDING_ENABLED:
+                for k in bend_fields:
+                    rec_out.pop(k, None)
 
             wr.writerow(rec_out)
 
+    # ---- NEW: bending-at-max-bbox-area ----
+    if BENDING_ENABLED:
+        if per_frame:
+            # Find the frame with maximum bounding-box area (w*h) over the FULL run
+            bbox_areas = [float(r["w"]) * float(r["h"]) for r in per_frame]
+            idx_bbox_max = int(np.argmax(bbox_areas))
+            rec_bbox_max = per_frame[idx_bbox_max]
+            bend_at_bbox_max_deg = float(rec_bbox_max.get("bend_deg", 0.0))
+            disp_at_bbox_max_mm  = float(rec_bbox_max.get("horiz_disp_mm", 0.0))
+            time_at_bbox_max     = float(rec_bbox_max["frame"]) * dt
+        else:
+            bend_at_bbox_max_deg = 0.0
+            disp_at_bbox_max_mm  = 0.0
+            time_at_bbox_max     = 0.0
+
     # ---- summary CSV (append/create) ----
     csv_summary = os.path.join(out_dir, "summary_results.csv")
-    header = [
-        "video","inflation_period_s",
-        "max_lin_mm","max_lin_time",
-        "max_rad_mm","max_rad_time",
-        "max_area_mm","max_area_time",
-        "max_bend_deg","max_bend_mm","max_bend_time",
-        "mm_per_px",
-    ]
+    if BENDING_ENABLED:
+        header = [
+            "video","inflation_period_s",
+            "max_lin_mm","max_lin_time",
+            "max_rad_mm","max_rad_time",
+            "max_area_mm","max_area_time",
+            # These are now the bend metrics AT max bbox area:
+            "max_bend_deg","max_bend_mm","max_bend_time",
+            "mm_per_px",
+        ]
+    else:
+        header = [
+            "video","inflation_period_s",
+            "max_lin_mm","max_lin_time",
+            "max_rad_mm","max_rad_time",
+            "max_area_mm","max_area_time",
+            "mm_per_px",
+        ]
     need_hdr = not os.path.exists(csv_summary)
 
     with open(csv_summary, "a", newline="") as f:
         wr = csv.DictWriter(f, fieldnames=header)
         if need_hdr:
             wr.writeheader()
-        wr.writerow(dict(
+        base_row = dict(
             video=name,
             inflation_period_s=DURATION_S,
             max_lin_mm=max_lin_mm,
@@ -483,11 +466,15 @@ def process(video_path, out_dir):
             max_rad_time=(0.0 if max_rad_frame is None else max_rad_frame * dt),
             max_area_mm=max_area_mm,
             max_area_time=(0.0 if max_area_frame is None else max_area_frame * dt),
-            max_bend_deg=max_bending_angle,
-            max_bend_mm=max_bending_dist,
-            max_bend_time=(0.0 if max_bend_frame is None else max_bend_frame * dt),
             mm_per_px=scale
-        ))
+        )
+        if BENDING_ENABLED:
+            base_row.update(dict(
+                max_bend_deg=bend_at_bbox_max_deg,
+                max_bend_mm=disp_at_bbox_max_mm,
+                max_bend_time=time_at_bbox_max,
+            ))
+        wr.writerow(base_row)
 
     print("✓ Finished", video_path,
           "\n  → annotated:", os.path.join(out_dir, f"{name}__annot.*"),
